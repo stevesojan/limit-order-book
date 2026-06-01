@@ -1,0 +1,84 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+env:
+  CARGO_TERM_COLOR: always
+  LOB_SKIP_DB: "1"
+  RUST_BACKTRACE: 1
+
+jobs:
+  rust:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-24.04, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: fmt
+        run: cargo fmt --all -- --check
+
+      - name: clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: test
+        run: cargo test --all-targets
+
+      - name: bench (smoke)
+        run: cargo bench -- --sample-size 10
+
+  postgres-integration:
+    runs-on: ubuntu-24.04
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: lob
+          POSTGRES_PASSWORD: lob
+          POSTGRES_DB: lob
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U lob -d lob"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: integration tests
+        env:
+          DATABASE_URL: postgres://lob:lob@localhost:5432/lob
+        run: cargo test --test postgres_integration -- --ignored
+
+  bdd:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build release binary
+        run: cargo build --release
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install behave
+        run: pip install behave
+      - name: Run BDD tests
+        env:
+          LOB_ENGINE_BIN: ${{ github.workspace }}/target/release/lob-engine
+          LOB_SKIP_DB: "1"
+        working-directory: tests/bdd
+        run: behave features
