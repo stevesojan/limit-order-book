@@ -10,15 +10,31 @@ Runs natively on **Linux** and **Windows**.
 flowchart TB
     CLI[CLI / Clap] --> SVC[EngineService]
     SVC --> ME[MatchingEngine]
-    ME --> OB[OrderBook]
+    ME --> MAP["HashMap InstrumentId → InstrumentMatcher"]
+    MAP --> OB[OrderBook per instrument]
     OB --> BIDS["BTreeMap Reverse Price → VecDeque OrderId"]
     OB --> ASKS["BTreeMap Price → VecDeque OrderId"]
     OB --> IDX["HashMap OrderId → Location"]
-    SVC --> ES[EventStore JSONL]
+    ME --> OIDX["HashMap OrderId → InstrumentId"]
+    SVC --> CMD[data/commands.jsonl]
+    SVC --> ES[data/events.jsonl]
     SVC --> PG[(PostgreSQL 17)]
-    ES --> REPLAY[Replay Engine]
+    CMD --> REPLAY[Replay Engine]
     REPLAY --> ME
 ```
+
+## Multi-instrument design
+
+Each symbol (`AAPL`, `MSFT`, `BTCUSD`, …) has an **independent** [`OrderBook`](src/book/mod.rs). The [`MatchingEngine`](src/matching/mod.rs) routes commands with **O(1)** `HashMap<InstrumentId, InstrumentMatcher>` lookup; matching logic inside each book is unchanged.
+
+| Layer | Lookup | Matching |
+|-------|--------|----------|
+| Engine | O(1) by `instrument_id` | Only within that book |
+| Book | O(log P) price levels | Price-time FIFO per level |
+
+Orders **never** match across instruments: `BUY AAPL` vs `SELL MSFT` at the same price produces no trade.
+
+**Performance:** Instrument routing is one `HashMap` get per command—negligible vs book operations. Benchmarks include 1 / 10 / 100 instruments (`cargo bench`, group `multi_instrument_insert`).
 
 ## Data Structures & Complexity
 
@@ -78,23 +94,40 @@ Skip database for local dev:
 $env:LOB_SKIP_DB = "1"
 ```
 
+## CLI state between runs
+
+Each `cargo run` is a **new process**. The engine reloads the book from **`data/commands.jsonl`** (append-only command log) on startup, then applies your new command. Audit events append to **`data/events.jsonl`**.
+
+To reset local state:
+
+```bash
+rm -f data/commands.jsonl data/events.jsonl   # Linux
+del data\commands.jsonl data\events.jsonl      # Windows
+```
+
 ## CLI Examples
 
 ```bash
-# Limit buy
-cargo run -- add-order --side buy --price 101 --quantity 100
+# Limit buy on AAPL
+cargo run -- add-order --instrument-id AAPL --side buy --price 101 --quantity 100
+
+# Limit sell on same instrument (matches if price crosses)
+cargo run -- add-order --instrument-id AAPL --side sell --price 101 --quantity 50
+
+# Different instrument — no cross-match
+cargo run -- add-order --instrument-id MSFT --side buy --price 300 --quantity 100
 
 # Market sell
-cargo run -- add-order --side sell --order-type market --quantity 50
+cargo run -- add-order --instrument-id AAPL --side sell --order-type market --quantity 50
 
 # Cancel
 cargo run -- cancel-order --order-id <UUID>
 
 # Modify (cancel + replace; keeps timestamp if price unchanged)
-cargo run -- modify-order --order-id <UUID> --side buy --price 101 --quantity 200
+cargo run -- modify-order --instrument-id AAPL --order-id <UUID> --side buy --price 101 --quantity 200
 
-# Snapshot
-cargo run -- snapshot --depth 5
+# Snapshot for one instrument only
+cargo run -- snapshot --instrument-id AAPL --depth 5
 
 # Replay command log (authoritative for determinism)
 cargo run -- replay examples/commands_price_time.json --commands
